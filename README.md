@@ -18,8 +18,8 @@ If you are using a fork that does not have the code changes, you will need to co
 Step 4: export the server urls in launch_openpilot.sh by adding this to that file.
 ```bash
 #!/usr/bin/bash
-export API_HOST=https://api.springerelectronics.com
-export ATHENA_HOST=wss://athena.springerelectronics.com
+export API_HOST=https://api.konik.ai
+export ATHENA_HOST=wss://athena.konik.ai
 # Any other custom launch options here
 exec ./launch_chffrplus.sh
 ```
