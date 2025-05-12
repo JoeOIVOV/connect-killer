@@ -26,9 +26,9 @@ use capnp::{
     serialize::{read_message, write_message}
 };
 
-use log_capnp::event as LogEvent;
-use crate::common;
 use crate::cereal::log_capnp;
+use crate::common;
+use crate::cereal::log_capnp::event as LogEvent;
 use crate::models::_entities::{devices, routes, segments};
 
 pub struct LogSegmentWorker {
@@ -63,18 +63,19 @@ impl LockManager {
     }
 
     pub async fn acquire_advisory_lock(&self, _db: &DatabaseConnection, key: u32) -> Result<(), DbErr> {
-        // This is the local server lock
+        //let start_time = Instant::now();
+
         let mut keys = self.keys.lock().await;
         while keys.contains_key(&key) {
-            // Drop the lock before awaiting and re-acquire it after being notified
             drop(keys);
+            //let wait_start = Instant::now();
             self.notify.notified().await;
             keys = self.keys.lock().await;
         }
 
         // Insert the key to indicate it is locked
         keys.insert(key, true);
-        /// TODO: Fix the global locking
+        // TODO: Fix the global locking
         // This is the global lock (literally for servers around the globe accessing the same db)
         // tracing::trace!("Attempting to acquire advisory lock with key: {}", key);
         // let sql = format!("SELECT pg_advisory_lock({})", key);
@@ -87,10 +88,11 @@ impl LockManager {
 
     pub async fn release_advisory_lock(&self, _db: &DatabaseConnection, key: u32) -> Result<(), DbErr> {
         let mut keys = self.keys.lock().await;
+        
         if keys.remove(&key).is_some() {
-            // Notify all waiting threads that a key has been removed
             self.notify.notify_waiters();
         }
+
         // tracing::trace!("Releasing advisory lock with key: {}", key);
         // let sql = format!("SELECT pg_advisory_unlock({})", key);
         // db.execute(Statement::from_string(db.get_database_backend(), sql)).await?;
@@ -104,7 +106,18 @@ impl LockManager {
 impl worker::AppWorker<LogSegmentWorkerArgs> for LogSegmentWorker {
     fn build(ctx: &AppContext) -> Self {
         static LOCK_MANAGER: Lazy<Arc<LockManager>> = Lazy::new(|| Arc::new(LockManager::new()));
-        pub static CLIENT: Lazy<Arc<Client>> = Lazy::new(|| Arc::new(Client::new()));
+        //pub static CLIENT: Lazy<Arc<Client>> = Lazy::new(|| Arc::new(Client::new()));
+        pub static CLIENT: Lazy<Arc<Client>> = Lazy::new(|| {
+            Arc::new(
+                Client::builder()
+                    .tcp_nodelay(true)
+                    .connect_timeout(std::time::Duration::from_secs(1))
+                    .timeout(std::time::Duration::from_secs(1)) // Response timeout
+                    .pool_idle_timeout(Some(std::time::Duration::from_secs(10)))
+                    .build()
+                    .expect("Failed to create HTTP client")
+            )
+        });
         Self { ctx: ctx.clone(), lock_manager: Arc::clone(&LOCK_MANAGER) , client: Arc::clone(&CLIENT)}
     }
 }
@@ -117,7 +130,6 @@ impl worker::Worker<LogSegmentWorkerArgs> for LogSegmentWorker {
         tracing::trace!("Starting QlogParser for URL: {}", args.internal_file_url);
         let client = self.client.clone();
         let api_endpoint: String = env::var("API_ENDPOINT").expect("API_ENDPOINT env variable not set");
-
         // check if the device is in the database
         let _device_model = match devices::Model::find_device(&self.ctx.db, &args.dongle_id).await {
             Ok(device) => device,
@@ -129,7 +141,8 @@ impl worker::Worker<LogSegmentWorkerArgs> for LogSegmentWorker {
 
         let canonical_route_name = format!("{}|{}", args.dongle_id, args.timestamp);
         let key = super::log_helpers::calculate_advisory_lock_key(&canonical_route_name);
-        lock_manager.acquire_advisory_lock(&self.ctx.db, key).await.map_err(|e| sidekiq::Error::Message(format!("Failed to aquire advisory lock: {}", e)))?; // blocks here until lok aquired
+        lock_manager.acquire_advisory_lock(&self.ctx.db, key).await
+            .map_err(|e| sidekiq::Error::Message(format!("Failed to aquire advisory lock: {}", e)))?; // blocks here until lock aquired
 
         let route_model = match routes::Model::find_route(&self.ctx.db,  &canonical_route_name).await {
             Ok(route) => route,
@@ -159,12 +172,14 @@ impl worker::Worker<LogSegmentWorkerArgs> for LogSegmentWorker {
                 }
             }
         };
-        self.lock_manager.release_advisory_lock(&self.ctx.db, key).await.map_err(|e| sidekiq::Error::Message(format!("Failed to release advisory lock: {}", e)))?;
+        self.lock_manager.release_advisory_lock(&self.ctx.db, key).await
+            .map_err(|e| sidekiq::Error::Message(format!("Failed to release advisory lock: {}", e)))?;
 
 
         let canonical_name = format!("{}|{}--{}", args.dongle_id, args.timestamp, args.segment);
         let key = super::log_helpers::calculate_advisory_lock_key(&canonical_name);
-        self.lock_manager.acquire_advisory_lock(&self.ctx.db, key).await.map_err(|e| sidekiq::Error::Message(format!("Failed to aquire advisory lock: {}", e)))?; // blocks here until lok aquired
+        self.lock_manager.acquire_advisory_lock(&self.ctx.db, key).await
+            .map_err(|e| sidekiq::Error::Message(format!("Failed to aquire advisory lock: {}", e)))?; // blocks here until lock aquired
         let segment = match segments::Model::find_one(&self.ctx.db, &canonical_name).await {
             Ok(segment) => segment, // The segment was added previously so here is the row.
             Err(e) => {  // Need to add the segment now.
@@ -209,7 +224,7 @@ impl worker::Worker<LogSegmentWorkerArgs> for LogSegmentWorker {
 
 
         let mut seg = segment.into_active_model();
-        let mut ignore_uploads = None;
+        //let mut ignore_uploads = None;
         let mut qlog_result: Option<QLogResult> = None;
         match args.file.as_str() {
             "rlog.bz2" | "rlog.zst" =>  {
@@ -244,12 +259,18 @@ impl worker::Worker<LogSegmentWorkerArgs> for LogSegmentWorker {
                     args.segment,
                     args.file));
             }
-            "fcamera.hevc" =>   seg.fcam_url = ActiveValue::Set(format!("{api_endpoint}/connectdata/fcam/{}/{}/{}/{}", args.dongle_id, args.timestamp, args.segment, args.file)),
-            "dcamera.hevc" =>   seg.dcam_url = ActiveValue::Set(format!("{api_endpoint}/connectdata/dcam/{}/{}/{}/{}", args.dongle_id, args.timestamp, args.segment, args.file)),
-            "ecamera.hevc" =>   seg.ecam_url = ActiveValue::Set(format!("{api_endpoint}/connectdata/ecam/{}/{}/{}/{}", args.dongle_id, args.timestamp, args.segment, args.file)),
+            "fcamera.hevc" =>   seg.fcam_url = ActiveValue::Set(
+                format!("{api_endpoint}/connectdata/fcam/{}/{}/{}/{}", args.dongle_id, args.timestamp, args.segment, args.file)
+            ),
+            "dcamera.hevc" =>   seg.dcam_url = ActiveValue::Set(
+                format!("{api_endpoint}/connectdata/dcam/{}/{}/{}/{}", args.dongle_id, args.timestamp, args.segment, args.file)
+            ),
+            "ecamera.hevc" =>   seg.ecam_url = ActiveValue::Set(
+                format!("{api_endpoint}/connectdata/ecam/{}/{}/{}/{}", args.dongle_id, args.timestamp, args.segment, args.file)
+            ),
             f => {
                 tracing::error!("Got invalid file type: {}", f);
-                ignore_uploads = Some(true);
+                //ignore_uploads = Some(true);
                 return Ok(())
             } // TODO: Mark for immediate deletion and block this user
         }
@@ -274,6 +295,21 @@ impl worker::Worker<LogSegmentWorkerArgs> for LogSegmentWorker {
         let mut active_route_model = route_model.into_active_model();
         if let Some(log) = qlog_result {
             active_route_model.platform = ActiveValue::Set(log.car_fingerprint);
+            active_route_model.git_remote = ActiveValue::Set(if log.git_remote.is_empty() {
+                None
+            } else {
+                Some(log.git_remote)
+            });
+            active_route_model.git_commit = ActiveValue::Set(if log.git_commit.is_empty() {
+                None
+            } else {
+                Some(log.git_commit)
+            });
+            active_route_model.git_branch = ActiveValue::Set(if log.git_branch.is_empty() {
+                None
+            } else {
+                Some(log.git_branch)
+            });
         }
         //let mut active_device_model = device_model.into_active_model();
         update_route_info(&self.ctx, &mut active_route_model, &segment_models).await?;
@@ -286,7 +322,9 @@ impl worker::Worker<LogSegmentWorkerArgs> for LogSegmentWorker {
                 return Err(sidekiq::Error::Message(e.to_string()));
             }
         }
-        self.lock_manager.release_advisory_lock(&self.ctx.db, key).await.map_err(|e| sidekiq::Error::Message(format!("Failed to release advisory lock: {}", e)))?;
+        self.lock_manager.release_advisory_lock(&self.ctx.db, key).await
+            .map_err(|e| sidekiq::Error::Message(format!("Failed to release advisory lock: {}", e))
+        )?;
 
         //active_device_model.update(&self.ctx.db).await.map_err(|e| sidekiq::Error::Message(e.to_string()))?;
         tracing::info!("Completed unlogging: {} in {:?}", args.internal_file_url, start_time.elapsed());
@@ -371,6 +409,17 @@ async fn update_route_info(
         }
     }
 
+    // We have looped through all the segments. If none have gps, then we need 
+    // to set the start time based on the first segment created_at which
+    // is the time the first segment was uploaded. created_at is in naive UTC
+    if !gps_seen {
+        let first_seg = segment_models.first().unwrap();
+        let created_time = first_seg.created_at.and_utc().timestamp_millis(); 
+        active_route_model.start_time_utc_millis = ActiveValue::Set(created_time);
+        active_route_model.start_time = ActiveValue::Set(Some(first_seg.created_at));
+        calculated_start_time = created_time - (first_seg.number as i64 * 60000); // first segment number may not be 0
+    }
+
     for segment_model in segment_models {
         let (seg_start_time, seg_end_time) = if segment_model.hpgps {
             (segment_model.start_time_utc_millis, segment_model.start_time_utc_millis)
@@ -397,7 +446,10 @@ async fn handle_qlog(
     ctx: &AppContext,
     client: &Client
 ) -> worker::Result<QLogResult> {
-    let bytes_stream = response.bytes_stream().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+    let bytes_stream = response
+        .bytes_stream()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)
+    );
     let stream_reader = StreamReader::new(bytes_stream);
     let mut decoder: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = if args.file.ends_with(".bz2") {
         Box::pin(bufread::BzDecoder::new(stream_reader))
@@ -423,7 +475,7 @@ struct QLogResult {
     git_remote: String,
     git_commit: String,
     openpilot_version: String,
-    device_type: crate::cereal::log_capnp::init_data::DeviceType,
+    device_type: log_capnp::init_data::DeviceType,
     start_time: i64,
     end_time: i64,
     total_time: i64,
@@ -437,12 +489,27 @@ impl Default for QLogResult {
             git_remote: "".to_string(),
             git_commit: "".to_string(),
             openpilot_version: "".to_string(),
-            device_type: crate::cereal::log_capnp::init_data::DeviceType::Unknown,
+            device_type: log_capnp::init_data::DeviceType::Unknown,
             start_time: -1,
             end_time: -1,
             total_time: 0,
         }
     }
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+struct StateData {
+    state: String,
+    enabled: bool,
+    alertStatus: i8,
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+struct JsonEvent {
+    r#type: String,
+    time: u64,
+    route_offset_millis:u64,
+    data: StateData,
 }
 
 async fn parse_qlog(
@@ -476,20 +543,24 @@ async fn parse_qlog(
     let mut last_lat = None;
     let mut last_lng = None;
     let mut coordinates: Vec<serde_json::Value> = Vec::new();
+    let mut events: Vec<serde_json::Value> = Vec::new();
     let mut qlog_result = QLogResult{..Default::default()};
 
     while let Ok(message_reader) = capnp::serialize::read_message(&mut cursor, ReaderOptions::default()) {
-        let event = message_reader.get_root::<LogEvent::Reader>().map_err(Box::from)?;
+        let event = match message_reader.get_root::<LogEvent::Reader>() {
+            Ok(event) => event,
+            Err(e) => {tracing::warn!("Failed to get root: {:?}", e); continue}, // Skip parsing if we can't get the root
+        };
 
         match event.which() {
-            Err(e) => {
-                tracing::warn!("Event type not in schema: {:?}", e);
-                continue; // Skip this iteration if matching fails
+            Err(_e) => {
+                //tracing::trace!("Event type not in schema: {:?}", e);
+                continue; // Skip this iteration if matching fails. This happends often
             }
             Ok(event_type) => {
+                let log_mono_time = event.get_log_mono_time();
                 match event_type {
                     LogEvent::GpsLocationExternal(gps) | LogEvent::GpsLocation(gps)=> {
-                        let log_mono_time = event.get_log_mono_time();
                         if let Ok(gps) = gps {
                             let gps_ts = gps.get_unix_timestamp_millis();
                             if (gps.get_flags() % 2 == 1) || gps.get_has_fix() { // has fix
@@ -534,7 +605,7 @@ async fn parse_qlog(
                                 seg.end_time_utc_millis = ActiveValue::Set(gps_ts);
                             }
                         }
-                        writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?;
+                        writeln!(unlog_data, "{:#?}", event).ok();
                     }
                     LogEvent::DeviceState(device_state) => {
                         if let Ok(device_state) = device_state {
@@ -543,7 +614,7 @@ async fn parse_qlog(
                                 onroad_mono_time = Some(device_state.get_started_mono_time());
                             }
                         }
-                        writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?
+                        writeln!(unlog_data, "{:#?}", event).ok();
                     }
                     LogEvent::Thumbnail(thumbnail) => {
                         // take the jpg and add it to the array of the other jpgs.
@@ -560,7 +631,7 @@ async fn parse_qlog(
                             .ok()
                             .and_then(|params| params.get_car_fingerprint().ok())
                             .map_or_else(String::new, |fp| fp.to_string().unwrap_or_default());
-                        writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?
+                        writeln!(unlog_data, "{:#?}", event).ok();
                     }
                     LogEvent::InitData(init_data) => {
                         if let Ok(init_data) = init_data {
@@ -578,23 +649,76 @@ async fn parse_qlog(
                                 .map_or_else(String::new, |d| d.to_string().unwrap_or_default());
                             qlog_result.device_type = init_data
                                 .get_device_type().ok()
-                                .map_or(crate::cereal::log_capnp::init_data::DeviceType::Unknown, |d| d);
+                                .map_or(log_capnp::init_data::DeviceType::Unknown, |d| d);
                         }
         
-                        writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?
-                    },
-                    LogEvent::PandaStates(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::Can(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::Sendcan(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::ErrorLogMessage(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::LogMessage(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::LiveParameters(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::LiveTorqueParameters(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::ManagerState(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::NavInstruction(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::OnroadEvents(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::UploaderState(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
-                    LogEvent::QcomGnss(_) => writeln!(unlog_data, "{:#?}", event).map_err(Box::from)?,
+                        writeln!(unlog_data, "{:#?}", event).ok();
+                    }
+                    LogEvent::OnroadEvents(onroad_event) => {
+                        if let Ok(onroad_event) = onroad_event {
+                            if onroad_event.len() == 0 {
+                                continue;
+                            }
+                            for car_event in onroad_event.iter() {
+                                let mut state = "disabled";
+                                let mut enabled: bool = false;
+                                let mut alert_status = 0;
+                                let mut _name = car_event.get_name().ok();
+                                let _no_entry = car_event.get_no_entry();
+                                let warning = car_event.get_warning();
+                                let _user_disable = car_event.get_user_disable();
+                                let soft_disable = car_event.get_soft_disable();
+                                let immediate_disable = car_event.get_immediate_disable();
+                                let _pre_enable = car_event.get_pre_enable();
+                                let _permanent = car_event.get_permanent();
+                                let overridden = car_event.get_override_lateral() || car_event.get_override_longitudinal();
+                                if car_event.get_enable() || car_event.get_pre_enable() {
+                                    state = "enabled";
+                                    enabled = true;
+                                }
+                                if overridden {
+                                    state = "overriding";
+                                    enabled = true
+                                }
+                                if car_event.get_user_disable() || car_event.get_soft_disable() || car_event.get_immediate_disable() {
+                                    state = "disabled";
+                                }
+                                if immediate_disable {
+                                    alert_status = 2;
+                                }
+                                if soft_disable || warning {
+                                    alert_status = 1;
+                                }
+
+                                if let Some(onroad_mono_time) = onroad_mono_time{
+                                    events.push(
+                                        serde_json::json!({
+                                            "type": "state",
+                                            "time": log_mono_time,
+                                            "route_offset_millis": (log_mono_time - onroad_mono_time) / 1000000,
+                                            "data": {
+                                                "state": state,
+                                                "enabled": enabled,
+                                                "alertStatus": alert_status,
+                                            }
+                                        })
+                                    )
+                                }
+                            }
+                        }
+                        writeln!(unlog_data, "{:#?}", event).ok();
+                    }
+                    LogEvent::PandaStates(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::Can(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::Sendcan(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::ErrorLogMessage(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::LogMessage(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::LiveParameters(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::LiveTorqueParameters(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::ManagerState(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::NavInstruction(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::UploaderState(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
+                    LogEvent::QcomGnss(_) => {writeln!(unlog_data, "{:#?}", event).ok();},
                     _ => continue, //writeln!(writer, "{:#?}", event).map_err(Box::from)?, // unlog everything?
                 }
             }
@@ -607,11 +731,23 @@ async fn parse_qlog(
         seg.miles = ActiveValue::Set((total_meters_traveled*0.000621371) as f32);
     }
 
-    let json_url = common::mkv_helpers::get_mkv_file_url(
+    let coords_url = common::mkv_helpers::get_mkv_file_url(
         &format!("{}_{}--{}--coords.json", args.dongle_id, args.timestamp, args.segment)
     );
-    upload_data(client, &json_url, serde_json::to_vec(&coordinates).map_err(Box::from)?).await?;
-    upload_data(&client, &args.internal_file_url.replace(".bz2", ".unlog").replace(".zst", ".unlog"), unlog_data).await?;
+
+    let events_url = common::mkv_helpers::get_mkv_file_url(
+        &format!("{}_{}--{}--events.json", args.dongle_id, args.timestamp, args.segment)
+    );
+    
+    upload_data(client, &coords_url, serde_json::to_vec(&coordinates).unwrap_or_default()).await;
+    upload_data(client, &events_url, serde_json::to_vec(&events).unwrap_or_default()).await;
+    upload_data(&client, 
+        &args.internal_file_url
+            .replace(".bz2", ".unlog")
+            .replace(".zst", ".unlog"),
+        unlog_data
+    ).await;
+
     let img_proc_start = Instant::now();
     if !thumbnails.is_empty() {
         // Downscale each thumbnail in parallel
@@ -644,7 +780,7 @@ async fn parse_qlog(
         let img_bytes = {
             let mut img_bytes: Vec<u8> = Vec::new();
             let mut encoder = JpegEncoder::new_with_quality(&mut img_bytes, 80);
-            encoder.encode_image(&DynamicImage::ImageRgba8(final_img)).map_err(Box::from)?;
+            encoder.encode_image(&DynamicImage::ImageRgba8(final_img)).ok();
             img_bytes
         };
 
@@ -652,7 +788,7 @@ async fn parse_qlog(
             &format!("{}_{}--{}--sprite.jpg", args.dongle_id, args.timestamp, args.segment)
         );
         tracing::trace!("Image proc took: {:?}", img_proc_start.elapsed());
-        upload_data(client, &sprite_url, img_bytes).await?;
+        upload_data(client, &sprite_url, img_bytes).await;
     }
 
     qlog_result.total_time = coordinates
@@ -664,18 +800,20 @@ async fn parse_qlog(
     Ok(qlog_result)
 }
 
-async fn upload_data(client: &Client, url: &str, body: Vec<u8>) -> worker::Result<()> {
-    let response = client.put(url)
-        .body(body)
-        .send().await
-        .map_err(Box::from)?;
-
-    if !response.status().is_success() {
-        tracing::debug!("Response status: {}", response.status());
-        return Err(sidekiq::Error::Message(format!("Failed to upload data to {}. Status code {}", url, response.status())));
+async fn upload_data(client: &Client, url: &str, body: Vec<u8>) {
+    match client.put(url).body(body).send().await {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                tracing::trace!("Uploaded data to {} with status {}", url, status);
+            } else {
+                tracing::error!("Failed to upload data to {} with status {}", url, status);
+            }
+        }
+        Err(e) => {
+            tracing::error!("Request to {} failed: {}", url, e);
+        }
     }
-    tracing::debug!("Uploaded {url} Response status: {}", response.status());
-    Ok(())
 }
 
 async fn get_qcam_duration(response: Response) -> Result<f32, FfmpegError> {
@@ -701,228 +839,4 @@ async fn get_qcam_duration(response: Response) -> Result<f32, FfmpegError> {
     let context = ffmpeg_format::input(&temp_file.path())?;
     let duration = context.duration() as f32 / 1_000_000.0;
     Ok(duration)
-}
-
-const MAX_FOLDER_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
-const MAX_FILE_COUNT: usize = 10;
-
-macro_rules! reader_to_builder {
-    ($set_fn:ident, $event_variant:ident, $event:expr, $event_builder:expr) => {
-        if let Ok(reader) = $event {
-            let _ = $event_builder.$set_fn(reader);
-        }
-    };
-}
-
-async fn anonamize_rlog(_ctx: &AppContext, response: Response, _client: &Client, args: &LogSegmentWorkerArgs) -> Result<(), Error> {
-    let start_time = Instant::now();
-
-    let bytes_stream = response.bytes_stream().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-    let stream_reader = StreamReader::new(bytes_stream);
-    let mut decoder: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = if args.file.ends_with(".bz2") {
-        Box::pin(bufread::BzDecoder::new(stream_reader))
-    } else if args.file.ends_with(".zst") {
-        Box::pin(bufread::ZstdDecoder::new(stream_reader))
-    } else {
-        return Err(Error::Message("Invalid File Compression".to_string()));
-    };
-
-    let mut decompressed_data = Vec::new();
-    match decoder.read_to_end(&mut decompressed_data).await {
-        Ok(_) => (),
-        Err(e) => return Err(Error::Message(e.to_string())),
-    };
-    let decompress_duration = start_time.elapsed();
-    tracing::trace!("Decompressing file stream took: {:?}", decompress_duration);
-
-    let process_start = Instant::now();
-    let mut cursor = Cursor::new(decompressed_data);
-    let mut writer = Vec::new();
-    let mut car_fingerprint: Option<String> = None;
-    let mut total_meters_traveled = 0.0; // gets converted to miles
-    let mut last_lat = None;
-    let mut last_lng = None;
-    let mut gps_seen = false;
-    while let Ok(message_reader) = read_message(&mut cursor, capnp::message::ReaderOptions::default()) {
-        let event = match message_reader.get_root::<LogEvent::Reader>() {
-            Ok(event) => event,
-            Err(_) => continue,
-        };
-        let mut message_builder = ::capnp::message::Builder::new_default();
-        let mut event_builder = message_builder.init_root::<LogEvent::Builder>();
-        event_builder.set_log_mono_time(event.get_log_mono_time());
-        let event_type = event.which().unwrap();
-        match event_type {
-            LogEvent::GpsLocationExternal(gps) | LogEvent::GpsLocation(gps)=> {
-                if let Ok(gps) = gps {
-                    if (gps.get_flags() % 2) == 1 { // has fix
-                        let lat = gps.get_latitude();
-                        let lng = gps.get_longitude();
-                        if !gps_seen { // gps_seen is false the first time
-                            gps_seen = true;
-                        }
-                        // Calculate distance if we have previous coordinates
-                        if let (Some(last_lat), Some(last_lng)) = (last_lat, last_lng) {
-                            total_meters_traveled += super::log_helpers::haversine_distance(
-                                last_lat, last_lng, lat, lng
-                            );
-                        }
-                        // Update last coordinates
-                        last_lat = Some(lat);
-                        last_lng = Some(lng);
-                    }
-                }
-                continue;
-            },
-            LogEvent::CarState(reader) => reader_to_builder!(set_car_state, event_type, reader, event_builder),
-            LogEvent::LiveParameters(reader) => reader_to_builder!(set_live_parameters, event_type, reader, event_builder),
-            LogEvent::CarControl(reader) => reader_to_builder!(set_car_control, event_type, reader, event_builder),
-            LogEvent::LateralPlanDEPRECATED(reader) => reader_to_builder!(set_lateral_plan_d_e_p_r_e_c_a_t_e_d, event_type, reader, event_builder),
-            LogEvent::CarOutput(reader) => reader_to_builder!(set_car_output, event_type, reader, event_builder),
-            LogEvent::ModelV2(reader) => reader_to_builder!(set_model_v2, event_type, reader, event_builder),
-            LogEvent::LiveTorqueParameters(reader) => reader_to_builder!(set_live_torque_parameters, event_type, reader, event_builder),
-            LogEvent::LiveCalibration(reader) => reader_to_builder!(set_live_calibration, event_type, reader, event_builder),
-            LogEvent::Sendcan(reader) => reader_to_builder!(set_sendcan, event_type, reader, event_builder),
-            LogEvent::Can(reader) => reader_to_builder!(set_can, event_type, reader, event_builder),
-            LogEvent::LongitudinalPlan(reader) => reader_to_builder!(set_longitudinal_plan, event_type, reader, event_builder),
-            LogEvent::CarParams(reader) => {
-                reader_to_builder!(set_car_params, event_type, reader, event_builder);
-                if let Ok(mut reader) = reader {
-                    car_fingerprint = Some(reader.get_car_fingerprint().unwrap().to_string().unwrap());
-                }
-            }
-            LogEvent::LiveLocationKalman(llk) => {
-                if let Ok(mut llk_reader) = llk {
-                    let mut builder = capnp::message::Builder::new_default();
-                    let mut llk_builder: log_capnp::live_location_kalman::Builder = builder.get_root::<log_capnp::live_location_kalman::Builder>().unwrap();
-                    llk_builder.set_angular_velocity_calibrated(llk_reader.get_angular_velocity_calibrated().unwrap());
-                    llk_builder.set_orientation_n_e_d(llk_reader.get_orientation_n_e_d().unwrap());
-                    llk_builder.set_calibrated_orientation_n_e_d(llk_reader.get_calibrated_orientation_n_e_d().unwrap());
-                    llk_reader = llk_builder.into_reader();
-                    event_builder.set_live_location_kalman(llk_reader).unwrap();
-                }
-            },
-            _ => continue,
-        }
-        write_message(&mut writer, &message_builder).unwrap();
-    }
-
-    let process_duration = process_start.elapsed();
-    tracing::trace!("Processing messages took: {:?}", process_duration);
-    if car_fingerprint.is_none() || (total_meters_traveled <= 40.0) {
-        return Ok(());
-    }
-    let platform = car_fingerprint.unwrap_or("mock".to_string()).clone();
-
-    let compress_start = Instant::now();
-    let compress_duration = compress_start.elapsed();
-    tracing::trace!("Compressing and writing file took: {:?}", compress_duration);
-    let prefix = "/tmp/anonlogs/";
-    let local_path = format!("{prefix}/{}/{}", &platform, &args.dongle_id);
-    let persistent_dir = std::path::Path::new(&local_path);
-    if !persistent_dir.exists() {
-        match std::fs::create_dir_all(persistent_dir) {
-            Ok(_) => (),
-            Err(e) => tracing::error!("Failed to create dir: {e}"),
-        }
-    }
-    let temp_path = persistent_dir.join(format!("{}--{}--{}", &args.timestamp, &args.segment, &args.file));
-    let temp_file = tokio::fs::File::create(&temp_path).await?;
-    let mut async_writer = tokio::io::BufWriter::new(temp_file);
-    let mut async_bz_encoder = BzEncoder::with_quality(&mut async_writer, async_compression::Level::Default);
-
-    async_bz_encoder.write_all(&writer).await?;
-    async_bz_encoder.shutdown().await?;
-    async_writer.flush().await?;
-
-    let folder_size = get_folder_size(persistent_dir)?;
-    let file_count = get_file_count(persistent_dir)?;
-
-    if folder_size >= MAX_FOLDER_SIZE || file_count >= MAX_FILE_COUNT {
-        let repo_path = format!("{}/{}", &platform, &args.dongle_id);
-        let _ = upload_folder_to_huggingface(&prefix, &repo_path).await; // Upload everything
-        clear_directory(persistent_dir)?; // only delete the dongle_id path to avoid a race
-    }
-
-    let total_duration = start_time.elapsed();
-    tracing::trace!("Total operation took: {:?}", total_duration);
-
-    Ok(())
-}
-
-fn get_folder_size(path: &std::path::Path) -> std::io::Result<u64> {
-    let mut size = 0;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_file() {
-            size += metadata.len();
-        }
-    }
-    Ok(size)
-}
-
-fn get_file_count(path: &std::path::Path) -> std::io::Result<usize> {
-    let mut count = 0;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.metadata()?.is_file() {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-async fn upload_folder_to_huggingface(folder_path: &str, repo_path: &str) -> Result<(), std::io::Error> {
-    let repo_id = "MoreTorque/rlogs";
-
-    // Clone the local_path and repo_path into owned Strings
-    let folder_path2 = folder_path.to_string();
-
-    // Spawn a blocking task to run the Python script
-    let result = tokio::task::spawn_blocking(move || {
-        let status = std::process::Command::new("huggingface-cli")
-            .arg("upload")
-            .arg(repo_id)
-            .arg(&folder_path2)
-            .arg("/")
-            .arg("--repo-type=dataset")
-            .status();
-
-        status
-    })
-    .await
-    .expect("Failed to run blocking task");
-
-    match result {
-        Ok(status) => {
-            if status.success() {
-                tracing::info!("Folder {} uploaded to Hugging Face successfully", folder_path);
-            } else {
-                tracing::error!("Failed to upload folder {} to Hugging Face", folder_path);
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to execute process: {}", e);
-            return Err(e);
-        }
-    }
-
-    Ok(())
-}
-
-fn clear_directory(path: &std::path::Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                clear_directory(&entry_path)?;
-                std::fs::remove_dir(&entry_path)?;
-            } else {
-                std::fs::remove_file(&entry_path)?;
-            }
-        }
-    }
-    Ok(())
 }

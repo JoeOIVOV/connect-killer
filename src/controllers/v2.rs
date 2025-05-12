@@ -5,7 +5,7 @@ use hex;
 use axum::{
     extract::{Form, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse},
+    response::IntoResponse,
 	body::Body,
 };
 use loco_rs::prelude::*;
@@ -98,8 +98,14 @@ pub async fn pilotauth(
     // TODO Add blacklist or whitelist here. Maybe a db table
     let result = DM::register_device(&ctx.db, params, &dongle_id).await;
     match result {
-        Ok(_) => (StatusCode::OK, format::json(PilotAuthResponse { dongle_id: dongle_id, access_token: "".into()})),
-        Err(result) => (StatusCode::FORBIDDEN, Err(loco_rs::Error::Model(result))),
+        Ok(_) => {
+            tracing::info!("Device registered: {}", &dongle_id);
+            return (StatusCode::OK, format::json(PilotAuthResponse { dongle_id: dongle_id, access_token: "".into()}))
+        }
+        Err(result) => {
+            tracing::error!("Failed to register device: {} {}", dongle_id,  result);
+            return (StatusCode::FORBIDDEN, Err(loco_rs::Error::Model(result)))
+        }
     }
 }
 
@@ -374,6 +380,34 @@ async fn post_auth( // used for portal
     format::json(GithubTokenResponse { access_token: token} )
 }
 
+/// Response for user token endpoint
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserTokenResponse {
+    pub access_token: String,
+}
+
+/// Returns the authenticated user's JWT auth token
+pub async fn get_user_token(
+    auth: crate::middleware::auth::MyJWT,
+    State(ctx): State<AppContext>,
+) -> impl IntoResponse {
+    let user_model = match auth.user_model {
+        Some(user) => user,
+        None => return (StatusCode::UNAUTHORIZED, "Failed to generate token").into_response(),
+    };
+    let jwt_secret = match ctx.config.get_jwt_config() {
+        Ok(secret) => secret,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate token").into_response(),
+    };
+    let token = match user_model.generate_jwt(&jwt_secret.secret, &jwt_secret.expiration) {
+        Ok(token) => token,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate token").into_response(),
+    };
+    match format::json(UserTokenResponse { access_token: token }) {
+        Ok(resp) => resp,
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize token").into_response(),
+    }
+}
 
 pub fn routes() -> Routes {
     Routes::new()
@@ -382,4 +416,5 @@ pub fn routes() -> Routes {
         .add("/pilotpair", post(pilotpair))
         .add("/auth", post(post_auth).get(get_auth))
         .add("/auth/h/redirect", get(github_redirect_handler))
+        .add("/user/token", get(get_user_token))
 }

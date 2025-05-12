@@ -12,12 +12,7 @@ use reqwest::Client;
 use tower_http::normalize_path::NormalizePathLayer;
 use tower_layer::Layer;
 use axum_server::tls_rustls::RustlsConfig;
-use axum::{
-    extract::Host,
-    handler::HandlerWithoutStateExt,
-    http::{StatusCode, Uri},
-    response::Redirect, Extension,
-};
+use axum::Extension;
 use loco_rs::{
     app::{AppContext, Hooks, Initializer},
     boot::{create_app, BootResult, StartMode},
@@ -27,6 +22,7 @@ use loco_rs::{
     task::Tasks,
     worker::{AppWorker, Processor},
     Result,
+    storage,
 };
 
 use crate::{
@@ -35,6 +31,7 @@ use crate::{
     initializers,
     controllers::ws::ConnectionManager, 
     models::_entities::{devices, users},
+    workers::log_helpers::persist_param_value_counts
 };
 
 pub struct App {}
@@ -75,6 +72,7 @@ impl Hooks for App {
             .add_route(controllers::connectincomming::routes())
             .add_route(controllers::connectdata::routes())
             .add_route(controllers::v1::routes())
+            .add_route(controllers::maps::routes())
     }
 
     fn connect_workers<'a>(p: &'a mut Processor, ctx: &'a AppContext) {
@@ -108,6 +106,14 @@ impl Hooks for App {
         //db::seed::<segments::ActiveModel>(db, &base.join("segments.yaml").display().to_string()).await?;
         Ok(())
     }
+
+    async fn after_context(ctx: AppContext) -> Result<AppContext> {
+        Ok(AppContext {
+            storage: storage::Storage::single(storage::drivers::local::new()).into(),
+            ..ctx
+        })
+    }
+
     async fn after_routes(router: axum::Router, ctx: &AppContext) -> Result<axum::Router> {
         let router = NormalizePathLayer::trim_trailing_slash().layer(router);
         let router = axum::Router::new().nest_service("", router);
@@ -129,6 +135,18 @@ impl Hooks for App {
             loop {
                 interval.tick().await;
                 crate::controllers::ws::send_ping_to_all_devices(ping_manager.clone(), &db_clone.clone()).await;
+            }
+        });
+
+        tokio::spawn({
+            let storage = ctx.storage.clone();
+            async move {
+                let mut interval = time::interval(time::Duration::from_secs(60)); // Save every 60 seconds
+                loop {
+                    interval.tick().await;
+                    persist_param_value_counts(&storage).await.unwrap();
+                    tracing::info!("Persisted param value counts");
+                }
             }
         });
 

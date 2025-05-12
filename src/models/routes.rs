@@ -112,14 +112,47 @@ impl RM {
         to: Option<i64>,
         limit: Option<u64>,
     ) -> ModelResult<Vec<RM>> {
+        let mut query = Entity::find().filter(Column::DeviceDongleId.eq(dongle_id));
+
+        if let Some(from_time) = from {
+            query = query.filter(Column::StartTimeUtcMillis.gte(from_time));
+        }
+        if let Some(to_time) = to {
+            query = query.filter(Column::StartTimeUtcMillis.lte(to_time));
+        }
+        if let Some(limit_val) = limit {
+            query = query.limit(limit_val);
+        }
+        let routes = query
+            .order_by_desc(Column::CreatedAt)
+            .all(db)
+            .await?;
+        Ok(routes)
+    }
+
+    pub async fn find_recent_device_routes(
+        db: &DatabaseConnection,
+        dongle_id: &str,
+        limit: Option<u64>,
+    ) -> ModelResult<Vec<RM>> {
         let routes = Entity::find()
             .filter(Column::DeviceDongleId.eq(dongle_id))
-            .filter(Column::StartTimeUtcMillis.gte(from))
-            .filter(Column::StartTimeUtcMillis.lte(to))
             .order_by_desc(Column::CreatedAt)
             .limit(limit)
             .all(db).await?;
         Ok(routes)
+    }
+
+    pub async fn is_public(
+        db: &DatabaseConnection,
+        fullname: &str,
+    ) -> ModelResult<bool> {
+        let route = Entity::find()
+            .filter(Column::Fullname.eq(fullname))
+            .one(db)
+            .await?
+            .unwrap_or_default();
+        Ok(route.is_public)
     }
 
     /// Finds all routes associated with a device.

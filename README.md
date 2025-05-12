@@ -1,5 +1,5 @@
 This is an open-source alternative to openpilot connect for use with openpilot software.
-To see the server in action, go to: https://stable.konik.com/
+To see the server in action, go to: https://stable.konik.ai/
 
 Thank you https://konik.ai for hosting!
 
